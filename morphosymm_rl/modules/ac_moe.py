@@ -115,6 +115,7 @@ class MoE_net(nn.Module):
         else:
             # top-k sparse MoE
             topk_vals, topk_idx = torch.topk(gate_logits, k=self.top_k, dim=-1)
+            self._topk_idx = topk_idx
 
             masked_logits = torch.full_like(gate_logits, float("-inf"))
             masked_logits.scatter_(dim=-1, index=topk_idx, src=topk_vals)
@@ -196,7 +197,7 @@ class MoE_net(nn.Module):
         batch_size = self._last_gate_weights.shape[0]
 
         if self.top_k >= 1 and self.top_k <= self.num_experts:
-            topk_idx = self.top_k
+            topk_idx = self._topk_idx
         else:
             topk_idx = torch.arange(N, device=self._last_gate_weights.device).unsqueeze(0).expand(batch_size, -1)
         
