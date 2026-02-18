@@ -104,6 +104,8 @@ class MoE_net(nn.Module):
 
         # [batch, K]
         gate_logits = self.gate(x)
+        unmasked_router_probs = self.softmax(gate_logits)
+        self._unmasked_router_probs = unmasked_router_probs 
 
         # ---- gating ----
         # Use sentinel < 0 to mean 'no top-k' so TorchScript never compares None with ints.
@@ -162,7 +164,7 @@ class MoE_net(nn.Module):
         if self.top_k >= 1 and self.top_k <= self.num_experts:
             # --- Sparse routing: Switch Transformer loss (Eq. 4-6) ---
             # router_probs: full softmax probabilities [batch, K]
-            router_probs = self._last_gate_weights.squeeze(1)  # [batch, K]
+            router_probs = self._unmasked_router_probs
             # f_i: fraction of samples dispatched to expert i (hard assignment, non-differentiable)
             expert_indices = router_probs.argmax(dim=-1)  # [batch]
             f = torch.zeros(N, device=router_probs.device)
