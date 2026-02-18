@@ -47,11 +47,13 @@ class MoE_net(nn.Module):
         use_gate_loss: bool = False,
         use_explicit_expert: bool = False,
         explicit_expert_epsilon: float = 0.8,
+        jitter_noise: float = 0.0,
     ):
         super().__init__()
         self.obs_dim = obs_dim
         self.act_dim = act_dim
         self.num_experts = num_experts
+        self.jitter_noise = jitter_noise
         # Use an integer sentinel (-1) for 'no top-k' to avoid Optional/None comparisons
         # which break TorchScript. Store as int.
         self.top_k = -1 if top_k is None else int(top_k)
@@ -106,6 +108,12 @@ class MoE_net(nn.Module):
 
         # [batch, K]
         gate_logits = self.gate(x)
+
+        # noise to logits before 
+        if self.training and self.jitter_noise > 0.0:
+            # Uniform noise in [1 - eps, 1 + eps]
+            noise = torch.empty_like(gate_logits).uniform_(1.0 - self.jitter_noise, 1.0 + self.jitter_noise)
+            gate_logits = gate_logits * noise
 
         # Full softmax over all experts (before any top-k masking)
         router_probs = self.softmax(gate_logits)  # [batch, K]
@@ -281,6 +289,7 @@ class ActorCriticMoE(nn.Module):
         use_explicit_expert = moe_cfg["use_explicit_expert"]
         explicit_expert_epsilon = moe_cfg["explicit_expert_epsilon"]
         gate_hidden_dims = moe_cfg["gate_hidden_dims"]
+        jitter_noise = moe_cfg.get("jitter_noise", 0.0)
 
         self.actor = MoE_net(
             obs_dim=num_actor_obs,
@@ -292,7 +301,8 @@ class ActorCriticMoE(nn.Module):
             top_k=top_k,
             use_gate_loss=use_gate_loss,
             use_explicit_expert=use_explicit_expert,
-            explicit_expert_epsilon=explicit_expert_epsilon
+            explicit_expert_epsilon=explicit_expert_epsilon,
+            jitter_noise=jitter_noise
         )
 
         # Actor observation normalization
@@ -314,7 +324,8 @@ class ActorCriticMoE(nn.Module):
             top_k=top_k,
             use_gate_loss=use_gate_loss,
             use_explicit_expert=use_explicit_expert,
-            explicit_expert_epsilon=explicit_expert_epsilon
+            explicit_expert_epsilon=explicit_expert_epsilon,
+            jitter_noise=jitter_noise
         )
 
         # Critic observation normalization
