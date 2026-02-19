@@ -361,7 +361,7 @@ class PPO:
             # MoE loss
             if hasattr(self.policy.actor, "use_gate_loss") and self.policy.actor.use_gate_loss:
                 gate_entropy = self.policy.gate_entropy()
-                gate_entropy_coef = 0.0001
+                gate_entropy_coef = 0.01
                 loss -= gate_entropy_coef * gate_entropy
 
             # Load-balancing auxiliary loss (Fedus et al., 2022)
