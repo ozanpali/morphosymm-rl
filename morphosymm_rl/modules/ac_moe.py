@@ -45,7 +45,6 @@ class MoE_net(nn.Module):
         num_experts: int = 4,
         top_k: int = -1,
         use_gate_loss: bool = False,
-        use_load_balance_loss: bool = False,
         use_explicit_expert: bool = False,
         explicit_expert_epsilon: float = 0.8,
     ):
@@ -63,7 +62,6 @@ class MoE_net(nn.Module):
         # to Tensor during execution.
         self._last_gate_weights = torch.empty(0)
         self.use_gate_loss = use_gate_loss
-        self.use_load_balance_loss = use_load_balance_loss
         
         self.use_explicit_expert = use_explicit_expert
         self.explicit_expert_epsilon = explicit_expert_epsilon
@@ -273,7 +271,7 @@ class ActorCriticMoE(nn.Module):
         raw_top_k = moe_cfg.get("top_k", -1)
         top_k = -1 if raw_top_k is None else int(raw_top_k)
         use_gate_loss = moe_cfg["use_gate_loss"]
-        use_load_balance_loss = moe_cfg["use_load_balance_loss"]
+        self.use_load_balance_loss = moe_cfg["use_load_balance_loss"]
         use_explicit_expert = moe_cfg["use_explicit_expert"]
         explicit_expert_epsilon = moe_cfg["explicit_expert_epsilon"]
         gate_hidden_dims = moe_cfg["gate_hidden_dims"]
@@ -288,7 +286,6 @@ class ActorCriticMoE(nn.Module):
             num_experts=num_experts,
             top_k=top_k,
             use_gate_loss=use_gate_loss,
-            use_load_balance_loss=use_load_balance_loss,
             use_explicit_expert=use_explicit_expert,
             explicit_expert_epsilon=explicit_expert_epsilon
         )
@@ -311,7 +308,6 @@ class ActorCriticMoE(nn.Module):
             num_experts=num_experts,
             top_k=top_k,
             use_gate_loss=use_gate_loss,
-            use_load_balance_loss=use_load_balance_loss,
             use_explicit_expert=use_explicit_expert,
             explicit_expert_epsilon=explicit_expert_epsilon
         )
