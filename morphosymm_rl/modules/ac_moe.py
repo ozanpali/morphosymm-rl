@@ -6,6 +6,8 @@ import torch
 import torch.nn as nn
 from torch.distributions import Normal
 from rsl_rl.utils import resolve_nn_activation
+from typing import Any, Dict, NoReturn
+from tensordict import TensorDict
 
 
 class MLP_net(nn.Sequential):
@@ -48,8 +50,6 @@ class MoE_net(nn.Module):
         use_explicit_expert: bool = False,
         explicit_expert_epsilon: float = 0.8,
         jitter_noise: float = 0.0,
-        use_load_balance_loss: bool = False,
-        log_expert_stats: bool = False,
     ):
         super().__init__()
         self.obs_dim = obs_dim
@@ -65,14 +65,9 @@ class MoE_net(nn.Module):
         # sees a consistent attribute type (Tensor) instead of switching from NoneType
         # to Tensor during execution.
         self._last_gate_weights = torch.empty(0)
-        # Full softmax router probabilities (before top-k masking), used for sparse load-balancing loss.
-        self._last_router_probs = torch.empty(0)
-        # Top-k indices for sparse routing (used for utilization stats)
-        self._last_topk_idx = torch.empty(0, dtype=torch.long)
+        self._last_unmasked_gate_weights = torch.empty(0)
+        self._topk_idx = torch.empty(0, dtype=torch.long)
         self.use_gate_loss = use_gate_loss
-        self.use_load_balance_loss = use_load_balance_loss
-        self.log_expert_stats = log_expert_stats
-        
         self.use_explicit_expert = use_explicit_expert
         self.explicit_expert_epsilon = explicit_expert_epsilon
 
@@ -119,28 +114,23 @@ class MoE_net(nn.Module):
             noise = torch.empty_like(gate_logits).uniform_(1.0 - self.jitter_noise, 1.0 + self.jitter_noise)
             gate_logits = gate_logits * noise
 
-        # Full softmax over all experts (before any top-k masking)
-        router_probs = self.softmax(gate_logits)  # [batch, K]
+        unmasked_router_probs = self.softmax(gate_logits)
+        self._unmasked_router_probs = unmasked_router_probs 
 
         # ---- gating ----
-        # Use sentinel < 0 to mean 'no top-k' so TorchScript never compares None with ints.
-        if self.top_k < 0 or self.top_k >= self.num_experts:
-            # standard dense MoE
-            weights = router_probs.unsqueeze(1)
-            # For counting: every expert is used for every sample
-            batch_size = router_probs.shape[0]
-            self._last_topk_idx  = torch.arange(self.num_experts, device=router_probs.device).unsqueeze(0).expand(batch_size, -1)
-        else:
+        if self.top_k >= 1 and self.top_k <= self.num_experts:
             # top-k sparse MoE
             topk_vals, topk_idx = torch.topk(gate_logits, k=self.top_k, dim=-1)
+            self._topk_idx = topk_idx
             masked_logits = torch.full_like(gate_logits, float("-inf"))
             masked_logits.scatter_(dim=-1, index=topk_idx, src=topk_vals)
             weights = self.softmax(masked_logits).unsqueeze(1)
-            self._last_topk_idx = topk_idx
+        else:
+            # standard dense MoE
+            weights = self.softmax(gate_logits).unsqueeze(1)
 
         # cache for PPO losses / logging
         self._last_gate_weights = weights
-        self._last_router_probs = router_probs
         
         if(self.use_explicit_expert):
             # Extract expert selectors from last num_experts elements
@@ -175,15 +165,13 @@ class MoE_net(nn.Module):
         Returns:
             Scalar loss tensor. Zero if no gate weights have been cached yet.
         """
-        if self._last_gate_weights.numel() == 0:
-            return torch.tensor(0.0)
 
         N = self.num_experts
 
-        if self.top_k >= 1 and self.top_k < N:
+        if self.top_k >= 1 and self.top_k <= self.num_experts:
             # --- Sparse routing: Switch Transformer loss (Eq. 4-6) ---
             # router_probs: full softmax probabilities [batch, K]
-            router_probs = self._last_router_probs  # [batch, K]
+            router_probs = self._unmasked_router_probs
             # f_i: fraction of samples dispatched to expert i (hard assignment, non-differentiable)
             expert_indices = router_probs.argmax(dim=-1)  # [batch]
             f = torch.zeros(N, device=router_probs.device)
@@ -210,14 +198,15 @@ class MoE_net(nn.Module):
             - ``percent_of_least_used_expert``: min utilization across experts.
         """
         stats: dict[str, torch.Tensor] = {}
-        if self._last_gate_weights.numel() == 0:
-            return stats
 
         N = self.num_experts
-        batch_size = self._last_router_probs.shape[0]
+        batch_size = self._last_gate_weights.shape[0]
 
-        # Sparse routing: count samples where each expert is in top-k
-        topk_idx = self._last_topk_idx  # [batch, top_k]
+        if self.top_k >= 1 and self.top_k <= self.num_experts:
+            topk_idx = self._topk_idx
+        else:
+            topk_idx = torch.arange(N, device=self._last_gate_weights.device).unsqueeze(0).expand(batch_size, -1)
+        
         # Flatten to count occurrences
         flat_idx = topk_idx.flatten()  # [batch * top_k]
         utilization_counts = torch.zeros(N, device=topk_idx.device, dtype=topk_idx.dtype)
@@ -294,8 +283,8 @@ class ActorCriticMoE(nn.Module):
         explicit_expert_epsilon = moe_cfg["explicit_expert_epsilon"]
         gate_hidden_dims = moe_cfg["gate_hidden_dims"]
         jitter_noise = moe_cfg.get("jitter_noise", 0.0)
-        use_load_balance_loss = moe_cfg.get("use_load_balance_loss", False)
-        log_expert_stats = moe_cfg.get("log_expert_stats", False)
+        self.use_load_balance_loss = moe_cfg["use_load_balance_loss"]
+        self.log_expert_stats = moe_cfg["log_expert_stats"]
 
         self.actor = MoE_net(
             obs_dim=num_actor_obs,
@@ -308,10 +297,7 @@ class ActorCriticMoE(nn.Module):
             use_gate_loss=use_gate_loss,
             use_explicit_expert=use_explicit_expert,
             explicit_expert_epsilon=explicit_expert_epsilon,
-            jitter_noise=jitter_noise,
-            use_load_balance_loss=use_load_balance_loss,
-            log_expert_stats=log_expert_stats
-            
+            jitter_noise=jitter_noise
         )
 
         # Actor observation normalization
@@ -334,9 +320,7 @@ class ActorCriticMoE(nn.Module):
             use_gate_loss=use_gate_loss,
             use_explicit_expert=use_explicit_expert,
             explicit_expert_epsilon=explicit_expert_epsilon,
-            jitter_noise=jitter_noise,
-            use_load_balance_loss=use_load_balance_loss,
-            log_expert_stats=log_expert_stats
+            jitter_noise=jitter_noise
         )
 
         # Critic observation normalization
@@ -395,9 +379,6 @@ class ActorCriticMoE(nn.Module):
         """
         Mean gate entropy from last forward pass (useful for PPO regularization)
         """
-        # If empty sentinel, return zero entropy
-        if self.actor._last_gate_weights.numel() == 0:
-            return torch.tensor(0.0)
         w = self.actor._last_gate_weights
         return -(w * torch.log(w + 1e-8)).sum(dim=-1).mean()
 
