@@ -367,7 +367,7 @@ class PPO:
             # Load-balancing auxiliary loss (Fedus et al., 2022)
             if hasattr(self.policy, "use_load_balance_loss") and self.policy.use_load_balance_loss:
                 lb_loss = self.policy.load_balance_loss()
-                load_balance_coef = 0.0001
+                load_balance_coef = 0.01
                 loss += load_balance_coef * lb_loss
 
             # Compute the gradients for PPO
