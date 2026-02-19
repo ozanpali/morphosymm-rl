@@ -50,6 +50,7 @@ class MoE_net(nn.Module):
         use_explicit_expert: bool = False,
         explicit_expert_epsilon: float = 0.8,
         jitter_noise: float = 0.0,
+        use_shared_backbone: bool = True,
     ):
         super().__init__()
         self.obs_dim = obs_dim
@@ -71,10 +72,26 @@ class MoE_net(nn.Module):
         self.use_explicit_expert = use_explicit_expert
         self.explicit_expert_epsilon = explicit_expert_epsilon
 
-        # experts
-        self.experts = nn.ModuleList(
-            [MLP_net(obs_dim, hidden_dims, act_dim, act) for _ in range(num_experts)]
-        )
+        self.use_shared_backbone = use_shared_backbone
+
+        if(self.use_shared_backbone):
+            # Shared trunk + separate expert heads
+            shared_layers = [nn.Linear(obs_dim, hidden_dims[0]), act]
+            for i in range(len(hidden_dims) - 1):
+                shared_layers += [nn.Linear(hidden_dims[i], hidden_dims[i + 1]), act]
+
+            self.shared_backbone = nn.Sequential(*shared_layers)
+            last_dim = hidden_dims[-1]
+
+            # single big linear for all experts
+            self.experts = nn.ModuleList(
+                [nn.Linear(last_dim, act_dim) for _ in range(num_experts)]
+            )
+        else:
+            # Separate NN Experts
+            self.experts = nn.ModuleList(
+                [MLP_net(obs_dim, hidden_dims, act_dim, act) for _ in range(num_experts)]
+            )
 
         # gating network
         gate_layers = []
@@ -103,7 +120,11 @@ class MoE_net(nn.Module):
         """
 
         # [batch, act_dim, K]
-        expert_out = torch.stack([e(x) for e in self.experts], dim=-1)
+        if(self.use_shared_backbone):
+            features = self.shared_backbone(x)
+            expert_out = torch.stack([e(features) for e in self.experts], dim=-1)
+        else:
+            expert_out = torch.stack([e(x) for e in self.experts], dim=-1)
 
         # [batch, K]
         gate_logits = self.gate(x)
@@ -125,6 +146,7 @@ class MoE_net(nn.Module):
             masked_logits = torch.full_like(gate_logits, float("-inf"))
             masked_logits.scatter_(dim=-1, index=topk_idx, src=topk_vals)
             weights = self.softmax(masked_logits).unsqueeze(1)
+            self._last_unmasked_gate_weights = self.softmax(gate_logits)  # [batch, K]
         else:
             # standard dense MoE
             weights = self.softmax(gate_logits).unsqueeze(1)
@@ -171,7 +193,8 @@ class MoE_net(nn.Module):
         if self.top_k >= 1 and self.top_k <= self.num_experts:
             # --- Sparse routing: Switch Transformer loss (Eq. 4-6) ---
             # router_probs: full softmax probabilities [batch, K]
-            router_probs = self._unmasked_router_probs
+            router_probs = self._last_unmasked_gate_weights.squeeze(1)  # [batch, K]
+            #router_probs = self._last_gate_weights.squeeze(1)  # [batch, K]
             # f_i: fraction of samples dispatched to expert i (hard assignment, non-differentiable)
             expert_indices = router_probs.argmax(dim=-1)  # [batch]
             f = torch.zeros(N, device=router_probs.device)
@@ -203,7 +226,7 @@ class MoE_net(nn.Module):
         batch_size = self._last_gate_weights.shape[0]
 
         if self.top_k >= 1 and self.top_k <= self.num_experts:
-            topk_idx = self._topk_idx
+            topk_idx = self._last_gate_weights.topk(k=self.top_k, dim=-1).indices  # [batch, K]
         else:
             topk_idx = torch.arange(N, device=self._last_gate_weights.device).unsqueeze(0).expand(batch_size, -1)
         
@@ -285,6 +308,7 @@ class ActorCriticMoE(nn.Module):
         jitter_noise = moe_cfg.get("jitter_noise", 0.0)
         self.use_load_balance_loss = moe_cfg["use_load_balance_loss"]
         self.log_expert_stats = moe_cfg["log_expert_stats"]
+        use_shared_backbone = moe_cfg["use_shared_backbone"]
 
         self.actor = MoE_net(
             obs_dim=num_actor_obs,
@@ -297,7 +321,8 @@ class ActorCriticMoE(nn.Module):
             use_gate_loss=use_gate_loss,
             use_explicit_expert=use_explicit_expert,
             explicit_expert_epsilon=explicit_expert_epsilon,
-            jitter_noise=jitter_noise
+            jitter_noise=jitter_noise,
+            use_shared_backbone=use_shared_backbone
         )
 
         # Actor observation normalization
@@ -320,7 +345,8 @@ class ActorCriticMoE(nn.Module):
             use_gate_loss=use_gate_loss,
             use_explicit_expert=use_explicit_expert,
             explicit_expert_epsilon=explicit_expert_epsilon,
-            jitter_noise=jitter_noise
+            jitter_noise=jitter_noise,
+            use_shared_backbone=use_shared_backbone
         )
 
         # Critic observation normalization
