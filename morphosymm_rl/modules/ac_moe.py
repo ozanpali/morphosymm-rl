@@ -48,6 +48,8 @@ class MoE_net(nn.Module):
         use_explicit_expert: bool = False,
         explicit_expert_epsilon: float = 0.8,
         jitter_noise: float = 0.0,
+        use_load_balance_loss: bool = False,
+        log_expert_stats: bool = False,
     ):
         super().__init__()
         self.obs_dim = obs_dim
@@ -68,6 +70,8 @@ class MoE_net(nn.Module):
         # Top-k indices for sparse routing (used for utilization stats)
         self._last_topk_idx = torch.empty(0, dtype=torch.long)
         self.use_gate_loss = use_gate_loss
+        self.use_load_balance_loss = use_load_balance_loss
+        self.log_expert_stats = log_expert_stats
         
         self.use_explicit_expert = use_explicit_expert
         self.explicit_expert_epsilon = explicit_expert_epsilon
@@ -290,6 +294,8 @@ class ActorCriticMoE(nn.Module):
         explicit_expert_epsilon = moe_cfg["explicit_expert_epsilon"]
         gate_hidden_dims = moe_cfg["gate_hidden_dims"]
         jitter_noise = moe_cfg.get("jitter_noise", 0.0)
+        use_load_balance_loss = moe_cfg.get("use_load_balance_loss", False)
+        log_expert_stats = moe_cfg.get("log_expert_stats", False)
 
         self.actor = MoE_net(
             obs_dim=num_actor_obs,
@@ -302,7 +308,10 @@ class ActorCriticMoE(nn.Module):
             use_gate_loss=use_gate_loss,
             use_explicit_expert=use_explicit_expert,
             explicit_expert_epsilon=explicit_expert_epsilon,
-            jitter_noise=jitter_noise
+            jitter_noise=jitter_noise,
+            use_load_balance_loss=use_load_balance_loss,
+            log_expert_stats=log_expert_stats
+            
         )
 
         # Actor observation normalization
@@ -325,7 +334,9 @@ class ActorCriticMoE(nn.Module):
             use_gate_loss=use_gate_loss,
             use_explicit_expert=use_explicit_expert,
             explicit_expert_epsilon=explicit_expert_epsilon,
-            jitter_noise=jitter_noise
+            jitter_noise=jitter_noise,
+            use_load_balance_loss=use_load_balance_loss,
+            log_expert_stats=log_expert_stats
         )
 
         # Critic observation normalization
