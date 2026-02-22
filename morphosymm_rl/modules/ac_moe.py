@@ -240,19 +240,32 @@ class MoE_net(nn.Module):
             - ``dead_experts``: number of experts with zero utilization.
             - ``percent_of_most_used_expert``: max utilization across experts.
             - ``percent_of_least_used_expert``: min utilization across experts.
-            - ``stored_observations``: all stored observation batches
-            - ``stored_gate_weights``: all stored gating network weight distributions
+            - ``mean weight of expert<i> for all fine``: mean gate weight for expert i when last 3 obs elements == [1, 0, 0]
+            - ``mean weight of expert<i> for rear failed``: mean gate weight for expert i when last 3 obs elements == [0, 0, 1]
         """
-        print("[DEBUG] Entered expert_utilization_stats at stats initialization.")
-        # # Store observations and gate weights for analysis
-        # if self.log_gate_distribution:
-        #     self.store_observation_and_gate(x)
-        #     breakpoint()
-        obs = torch.cat(self._stored_observations, dim=0)
-        gates = torch.cat(self._stored_gate_weights, dim=0)
-        breakpoint()
         stats: dict[str, torch.Tensor] = {}
 
+        # mean weight for each expert conditioned on 4 leg and 2 leg walking 
+        obs = torch.cat(self._stored_observations, dim=0) # obs: [N, 275] only for actor
+        gates = torch.cat(self._stored_gate_weights, dim=0) # gates: [N, 275] only for actor
+        
+        allfine_mask = (obs[:, -3:].round().int() == torch.tensor([1, 0, 0], device=obs.device)).all(dim=1)
+        all_fine_mask = allfine_mask.nonzero(as_tuple=True)[0]
+        all_fine_experts_mean = gates[all_fine_mask].mean(dim=0)
+        
+        rearfailed_mask = (obs[:, -3:].round().int() == torch.tensor([0, 0, 1], device=obs.device)).all(dim=1)
+        rear_failed_mask = rearfailed_mask.nonzero(as_tuple=True)[0]
+        rear_failed_experts_mean = gates[rear_failed_mask].mean(dim=0)
+
+        # Log mean weight for each expert for all fine
+        for i in range(5):
+            stats[f"mean weight of expert{i} for all fine"] = all_fine_experts_mean[i].detach()
+
+        # Log mean weight for each expert for rear failed
+        for i in range(5):
+            stats[f"mean weight of expert{i} for rear failed"] = rear_failed_experts_mean[i].detach()
+
+        # percent utilization, mean weight of each expert and logging number of dead experts
         N = self.num_experts
         batch_size = self._last_gate_weights.shape[0]
 
@@ -283,14 +296,13 @@ class MoE_net(nn.Module):
         stats["percent_of_most_used_expert"] = hard_fracs.max().detach()
         stats["percent_of_least_used_expert"] = hard_fracs.min().detach()
 
-        # Add stored observations and gate weights if available
-        obs = torch.cat(self._stored_observations, dim=0) if len(self._stored_observations) > 0 else torch.empty(0)
-        gates = torch.cat(self._stored_gate_weights, dim=0) if len(self._stored_gate_weights) > 0 else torch.empty(0)
-        # # breakpoint()
-        # stats["stored_observations"] = obs
-        # stats["stored_gate_weights"] = gates
-
+        # Reset stored observations and gate weights after processing
+        self._stored_observations = []
+        self._stored_gate_weights = []
+        
         return stats
+
+
 
 
 class ActorCriticMoE(nn.Module):
