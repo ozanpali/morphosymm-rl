@@ -51,6 +51,7 @@ class MoE_net(nn.Module):
         explicit_expert_epsilon: float = 0.8,
         jitter_noise: float = 0.0,
         use_shared_backbone: bool = True,
+        log_gate_distribution: bool = False
     ):
         super().__init__()
         self.obs_dim = obs_dim
@@ -61,6 +62,10 @@ class MoE_net(nn.Module):
         # which break TorchScript. Store as int.
         self.top_k = -1 if top_k is None else int(top_k)
         act = resolve_nn_activation(activation)
+
+        # Always initialize storage attributes
+        self._stored_observations = []
+        self._stored_gate_weights = []
 
         # Store last gate weights as a tensor sentinel (empty tensor) so TorchScript
         # sees a consistent attribute type (Tensor) instead of switching from NoneType
@@ -73,7 +78,7 @@ class MoE_net(nn.Module):
         self.explicit_expert_epsilon = explicit_expert_epsilon
 
         self.use_shared_backbone = use_shared_backbone
-
+        self.log_gate_distribution = log_gate_distribution
         if(self.use_shared_backbone):
             # Shared trunk + separate expert heads
             shared_layers = [nn.Linear(obs_dim, hidden_dims[0]), act]
@@ -104,6 +109,19 @@ class MoE_net(nn.Module):
         self.gate = nn.Sequential(*gate_layers)
 
         self.softmax = nn.Softmax(dim=-1)  # ONNX-friendly
+    
+    def store_observation_and_gate(self, x: torch.Tensor):
+        """Store observation batch and gating network weight distribution for analysis."""
+        self._stored_observations.append(x.detach().cpu())
+        gate_logits = self.gate(x)
+        gate_weights = self.softmax(gate_logits)
+        self._stored_gate_weights.append(gate_weights.detach().cpu())
+
+    def get_stored_observations_and_gates(self):
+        """Retrieve stored observations and gating weights."""
+        obs = torch.cat(self._stored_observations, dim=0) if len(self._stored_observations) > 0 else torch.empty(0)
+        gates = torch.cat(self._stored_gate_weights, dim=0) if len(self._stored_gate_weights) > 0 else torch.empty(0)
+        return obs, gates
 
     def __getitem__(self, idx: int):
         """Allow indexing into the MoE to get the underlying expert module
@@ -118,6 +136,11 @@ class MoE_net(nn.Module):
         Returns:
             mean action: [batch, act_dim]
         """
+
+        # Store observations and gate weights for analysis
+        if self.log_gate_distribution:
+            self.store_observation_and_gate(x)
+            breakpoint()
 
         # [batch, act_dim, K]
         if(self.use_shared_backbone):
@@ -219,6 +242,8 @@ class MoE_net(nn.Module):
             - ``dead_experts``: number of experts with zero utilization.
             - ``percent_of_most_used_expert``: max utilization across experts.
             - ``percent_of_least_used_expert``: min utilization across experts.
+            - ``stored_observations``: all stored observation batches
+            - ``stored_gate_weights``: all stored gating network weight distributions
         """
         stats: dict[str, torch.Tensor] = {}
 
@@ -251,6 +276,13 @@ class MoE_net(nn.Module):
         stats["dead_experts"] = (hard_fracs == 0).sum().float().detach()
         stats["percent_of_most_used_expert"] = hard_fracs.max().detach()
         stats["percent_of_least_used_expert"] = hard_fracs.min().detach()
+
+        # Add stored observations and gate weights if available
+        obs = torch.cat(self._stored_observations, dim=0) if len(self._stored_observations) > 0 else torch.empty(0)
+        gates = torch.cat(self._stored_gate_weights, dim=0) if len(self._stored_gate_weights) > 0 else torch.empty(0)
+        # # breakpoint()
+        # stats["stored_observations"] = obs
+        # stats["stored_gate_weights"] = gates
 
         return stats
 
@@ -309,6 +341,7 @@ class ActorCriticMoE(nn.Module):
         self.use_load_balance_loss = moe_cfg["use_load_balance_loss"]
         self.log_expert_stats = moe_cfg["log_expert_stats"]
         use_shared_backbone = moe_cfg["use_shared_backbone"]
+        log_gate_distribution = moe_cfg["log_gate_distribution"]
 
         self.actor = MoE_net(
             obs_dim=num_actor_obs,
@@ -322,7 +355,9 @@ class ActorCriticMoE(nn.Module):
             use_explicit_expert=use_explicit_expert,
             explicit_expert_epsilon=explicit_expert_epsilon,
             jitter_noise=jitter_noise,
-            use_shared_backbone=use_shared_backbone
+            use_shared_backbone=use_shared_backbone,
+            log_gate_distribution=log_gate_distribution
+            
         )
 
         # Actor observation normalization
@@ -346,7 +381,8 @@ class ActorCriticMoE(nn.Module):
             use_explicit_expert=use_explicit_expert,
             explicit_expert_epsilon=explicit_expert_epsilon,
             jitter_noise=jitter_noise,
-            use_shared_backbone=use_shared_backbone
+            use_shared_backbone=use_shared_backbone,
+            log_gate_distribution=False
         )
 
         # Critic observation normalization
@@ -496,3 +532,24 @@ class ActorCriticMoE(nn.Module):
         """
         super().load_state_dict(state_dict, strict=strict)
         return True
+
+    def store_observation_and_gate(self, x: torch.Tensor):
+        """Store observation batch and gating network weight distribution for analysis."""
+        # Store the input observations
+        if not hasattr(self, "_stored_observations"):
+            self._stored_observations = []
+        self._stored_observations.append(x.detach().cpu())
+
+        # Store the gating weights
+        gate_logits = self.gate(x)
+        gate_weights = self.softmax(gate_logits)
+        if not hasattr(self, "_stored_gate_weights"):
+            self._stored_gate_weights = []
+        self._stored_gate_weights.append(gate_weights.detach().cpu())
+        breakpoint()
+
+    def get_stored_observations_and_gates(self):
+        """Retrieve stored observations and gating weights."""
+        obs = torch.cat(self._stored_observations, dim=0) if hasattr(self, "_stored_observations") else None
+        gates = torch.cat(self._stored_gate_weights, dim=0) if hasattr(self, "_stored_gate_weights") else None
+        return obs, gates
