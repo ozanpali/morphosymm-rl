@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 from torch.distributions import Normal
 from rsl_rl.utils import resolve_nn_activation
-from typing import Any, Dict, NoReturn
+from typing import Any, NoReturn
 from tensordict import TensorDict
 
 
@@ -51,6 +51,7 @@ class MoE_net(nn.Module):
         explicit_expert_epsilon: float = 0.8,
         jitter_noise: float = 0.0,
         use_shared_backbone: bool = True,
+        log_gate_distribution: bool = False
     ):
         super().__init__()
         self.obs_dim = obs_dim
@@ -62,18 +63,21 @@ class MoE_net(nn.Module):
         self.top_k = -1 if top_k is None else int(top_k)
         act = resolve_nn_activation(activation)
 
+        # Always initialize storage attributes
+        self._stored_observations = []
+        self._stored_gate_weights = []
+
         # Store last gate weights as a tensor sentinel (empty tensor) so TorchScript
         # sees a consistent attribute type (Tensor) instead of switching from NoneType
         # to Tensor during execution.
         self._last_gate_weights = torch.empty(0)
         self._last_unmasked_gate_weights = torch.empty(0)
-        self._topk_idx = torch.empty(0, dtype=torch.long)
         self.use_gate_loss = use_gate_loss
         self.use_explicit_expert = use_explicit_expert
         self.explicit_expert_epsilon = explicit_expert_epsilon
 
         self.use_shared_backbone = use_shared_backbone
-
+        self.log_gate_distribution = log_gate_distribution
         if(self.use_shared_backbone):
             # Shared trunk + separate expert heads
             shared_layers = [nn.Linear(obs_dim, hidden_dims[0]), act]
@@ -104,6 +108,13 @@ class MoE_net(nn.Module):
         self.gate = nn.Sequential(*gate_layers)
 
         self.softmax = nn.Softmax(dim=-1)  # ONNX-friendly
+    
+    def store_observation_and_gate(self, x: torch.Tensor):
+        """Store observation batch and gating network weight distribution for analysis."""
+        self._stored_observations.append(x.detach().cpu())
+        gate_logits = self.gate(x)
+        gate_weights = self.softmax(gate_logits)
+        self._stored_gate_weights.append(gate_weights.detach().cpu())
 
     def __getitem__(self, idx: int):
         """Allow indexing into the MoE to get the underlying expert module
@@ -118,6 +129,10 @@ class MoE_net(nn.Module):
         Returns:
             mean action: [batch, act_dim]
         """
+
+        # # Store observations and gate weights for analysis
+        if self.log_gate_distribution:
+            self.store_observation_and_gate(x)
 
         # [batch, act_dim, K]
         if(self.use_shared_backbone):
@@ -142,7 +157,6 @@ class MoE_net(nn.Module):
         if self.top_k >= 1 and self.top_k <= self.num_experts:
             # top-k sparse MoE
             topk_vals, topk_idx = torch.topk(gate_logits, k=self.top_k, dim=-1)
-            self._topk_idx = topk_idx
             masked_logits = torch.full_like(gate_logits, float("-inf"))
             masked_logits.scatter_(dim=-1, index=topk_idx, src=topk_vals)
             weights = self.softmax(masked_logits).unsqueeze(1)
@@ -210,7 +224,6 @@ class MoE_net(nn.Module):
             mean_w = w.mean(dim=0)  # [K]
             return ((mean_w - 1.0 / N) ** 2).sum()
 
-
     def expert_utilization_stats(self) -> dict[str, torch.Tensor]:
         """Per-expert utilization statistics from the last forward pass.
 
@@ -219,9 +232,32 @@ class MoE_net(nn.Module):
             - ``dead_experts``: number of experts with zero utilization.
             - ``percent_of_most_used_expert``: max utilization across experts.
             - ``percent_of_least_used_expert``: min utilization across experts.
+            - ``mean weight of expert<i> for all fine``: mean gate weight for expert i when last 3 obs elements == [1, 0, 0]
+            - ``mean weight of expert<i> for rear failed``: mean gate weight for expert i when last 3 obs elements == [0, 0, 1]
         """
         stats: dict[str, torch.Tensor] = {}
 
+        # mean weight for each expert conditioned on 4 leg and 2 leg walking 
+        obs = torch.cat(self._stored_observations, dim=0) # obs: [N, 275] only for actor
+        gates = torch.cat(self._stored_gate_weights, dim=0) # gates: [N, 275] only for actor
+        
+        allfine_mask = (obs[:, -3:].round().int() == torch.tensor([1, 0, 0], device=obs.device)).all(dim=1)
+        all_fine_mask = allfine_mask.nonzero(as_tuple=True)[0]
+        all_fine_experts_mean = gates[all_fine_mask].mean(dim=0)
+        
+        rearfailed_mask = (obs[:, -3:].round().int() == torch.tensor([0, 0, 1], device=obs.device)).all(dim=1)
+        rear_failed_mask = rearfailed_mask.nonzero(as_tuple=True)[0]
+        rear_failed_experts_mean = gates[rear_failed_mask].mean(dim=0)
+
+        # Log mean weight for each expert for all fine
+        for i in range(5):
+            stats[f"mean weight of expert{i} for all fine"] = all_fine_experts_mean[i].detach()
+
+        # Log mean weight for each expert for rear failed
+        for i in range(5):
+            stats[f"mean weight of expert{i} for rear failed"] = rear_failed_experts_mean[i].detach()
+
+        # percent utilization, mean weight of each expert and logging number of dead experts
         N = self.num_experts
         batch_size = self._last_gate_weights.shape[0]
 
@@ -252,7 +288,13 @@ class MoE_net(nn.Module):
         stats["percent_of_most_used_expert"] = hard_fracs.max().detach()
         stats["percent_of_least_used_expert"] = hard_fracs.min().detach()
 
+        # Reset stored observations and gate weights after processing
+        self._stored_observations = []
+        self._stored_gate_weights = []
+
         return stats
+
+
 
 
 class ActorCriticMoE(nn.Module):
@@ -309,6 +351,7 @@ class ActorCriticMoE(nn.Module):
         self.use_load_balance_loss = moe_cfg["use_load_balance_loss"]
         self.log_expert_stats = moe_cfg["log_expert_stats"]
         use_shared_backbone = moe_cfg["use_shared_backbone"]
+        log_gate_distribution = moe_cfg["log_gate_distribution"]
 
         self.actor = MoE_net(
             obs_dim=num_actor_obs,
@@ -322,7 +365,9 @@ class ActorCriticMoE(nn.Module):
             use_explicit_expert=use_explicit_expert,
             explicit_expert_epsilon=explicit_expert_epsilon,
             jitter_noise=jitter_noise,
-            use_shared_backbone=use_shared_backbone
+            use_shared_backbone=use_shared_backbone,
+            log_gate_distribution=log_gate_distribution
+            
         )
 
         # Actor observation normalization
@@ -346,7 +391,8 @@ class ActorCriticMoE(nn.Module):
             use_explicit_expert=use_explicit_expert,
             explicit_expert_epsilon=explicit_expert_epsilon,
             jitter_noise=jitter_noise,
-            use_shared_backbone=use_shared_backbone
+            use_shared_backbone=use_shared_backbone,
+            log_gate_distribution=False
         )
 
         # Critic observation normalization
@@ -496,3 +542,4 @@ class ActorCriticMoE(nn.Module):
         """
         super().load_state_dict(state_dict, strict=strict)
         return True
+
