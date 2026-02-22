@@ -137,10 +137,10 @@ class MoE_net(nn.Module):
             mean action: [batch, act_dim]
         """
 
-        # Store observations and gate weights for analysis
+        # # Store observations and gate weights for analysis
         if self.log_gate_distribution:
             self.store_observation_and_gate(x)
-            breakpoint()
+        #     breakpoint()
 
         # [batch, act_dim, K]
         if(self.use_shared_backbone):
@@ -245,6 +245,14 @@ class MoE_net(nn.Module):
             - ``stored_observations``: all stored observation batches
             - ``stored_gate_weights``: all stored gating network weight distributions
         """
+        print("[DEBUG] Entered expert_utilization_stats at stats initialization.")
+        # # Store observations and gate weights for analysis
+        # if self.log_gate_distribution:
+        #     self.store_observation_and_gate(x)
+        #     breakpoint()
+        obs = torch.cat(self._stored_observations, dim=0)
+        gates = torch.cat(self._stored_gate_weights, dim=0)
+        breakpoint()
         stats: dict[str, torch.Tensor] = {}
 
         N = self.num_experts
