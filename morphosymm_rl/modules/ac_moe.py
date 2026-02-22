@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 from torch.distributions import Normal
 from rsl_rl.utils import resolve_nn_activation
-from typing import Any, Dict, NoReturn
+from typing import Any, NoReturn
 from tensordict import TensorDict
 
 
@@ -116,12 +116,6 @@ class MoE_net(nn.Module):
         gate_weights = self.softmax(gate_logits)
         self._stored_gate_weights.append(gate_weights.detach().cpu())
 
-    def get_stored_observations_and_gates(self):
-        """Retrieve stored observations and gating weights."""
-        obs = torch.cat(self._stored_observations, dim=0) if len(self._stored_observations) > 0 else torch.empty(0)
-        gates = torch.cat(self._stored_gate_weights, dim=0) if len(self._stored_gate_weights) > 0 else torch.empty(0)
-        return obs, gates
-
     def __getitem__(self, idx: int):
         """Allow indexing into the MoE to get the underlying expert module
         (keeps compatibility with code doing `actor[0]`).
@@ -139,7 +133,6 @@ class MoE_net(nn.Module):
         # # Store observations and gate weights for analysis
         if self.log_gate_distribution:
             self.store_observation_and_gate(x)
-        #     breakpoint()
 
         # [batch, act_dim, K]
         if(self.use_shared_backbone):
@@ -231,7 +224,6 @@ class MoE_net(nn.Module):
             mean_w = w.mean(dim=0)  # [K]
             return ((mean_w - 1.0 / N) ** 2).sum()
 
-
     def expert_utilization_stats(self) -> dict[str, torch.Tensor]:
         """Per-expert utilization statistics from the last forward pass.
 
@@ -299,7 +291,7 @@ class MoE_net(nn.Module):
         # Reset stored observations and gate weights after processing
         self._stored_observations = []
         self._stored_gate_weights = []
-        
+
         return stats
 
 
