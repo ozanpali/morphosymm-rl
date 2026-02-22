@@ -72,7 +72,6 @@ class MoE_net(nn.Module):
         # to Tensor during execution.
         self._last_gate_weights = torch.empty(0)
         self._last_unmasked_gate_weights = torch.empty(0)
-        self._topk_idx = torch.empty(0, dtype=torch.long)
         self.use_gate_loss = use_gate_loss
         self.use_explicit_expert = use_explicit_expert
         self.explicit_expert_epsilon = explicit_expert_epsilon
@@ -165,7 +164,6 @@ class MoE_net(nn.Module):
         if self.top_k >= 1 and self.top_k <= self.num_experts:
             # top-k sparse MoE
             topk_vals, topk_idx = torch.topk(gate_logits, k=self.top_k, dim=-1)
-            self._topk_idx = topk_idx
             masked_logits = torch.full_like(gate_logits, float("-inf"))
             masked_logits.scatter_(dim=-1, index=topk_idx, src=topk_vals)
             weights = self.softmax(masked_logits).unsqueeze(1)
@@ -541,23 +539,3 @@ class ActorCriticMoE(nn.Module):
         super().load_state_dict(state_dict, strict=strict)
         return True
 
-    def store_observation_and_gate(self, x: torch.Tensor):
-        """Store observation batch and gating network weight distribution for analysis."""
-        # Store the input observations
-        if not hasattr(self, "_stored_observations"):
-            self._stored_observations = []
-        self._stored_observations.append(x.detach().cpu())
-
-        # Store the gating weights
-        gate_logits = self.gate(x)
-        gate_weights = self.softmax(gate_logits)
-        if not hasattr(self, "_stored_gate_weights"):
-            self._stored_gate_weights = []
-        self._stored_gate_weights.append(gate_weights.detach().cpu())
-        breakpoint()
-
-    def get_stored_observations_and_gates(self):
-        """Retrieve stored observations and gating weights."""
-        obs = torch.cat(self._stored_observations, dim=0) if hasattr(self, "_stored_observations") else None
-        gates = torch.cat(self._stored_gate_weights, dim=0) if hasattr(self, "_stored_gate_weights") else None
-        return obs, gates
