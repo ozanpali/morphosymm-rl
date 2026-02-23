@@ -51,7 +51,8 @@ class MoE_net(nn.Module):
         explicit_expert_epsilon: float = 0.8,
         jitter_noise: float = 0.0,
         use_shared_backbone: bool = True,
-        log_gate_distribution: bool = False
+        log_gate_distribution: bool = False,
+        gate: nn.Module = None
     ):
         super().__init__()
         self.obs_dim = obs_dim
@@ -97,15 +98,19 @@ class MoE_net(nn.Module):
                 [MLP_net(obs_dim, hidden_dims, act_dim, act) for _ in range(num_experts)]
             )
 
-        # gating network
-        gate_layers = []
-        last_dim = obs_dim
-        gate_hidden_dims = gate_hidden_dims or []
-        for h in gate_hidden_dims:
-            gate_layers += [nn.Linear(last_dim, h), act]
-            last_dim = h
-        gate_layers.append(nn.Linear(last_dim, num_experts))
-        self.gate = nn.Sequential(*gate_layers)
+
+        # gating network (shared or new)
+        if gate is not None:
+            self.gate = gate
+        else:
+            gate_layers = []
+            last_dim = obs_dim
+            gate_hidden_dims = gate_hidden_dims or []
+            for h in gate_hidden_dims:
+                gate_layers += [nn.Linear(last_dim, h), act]
+                last_dim = h
+            gate_layers.append(nn.Linear(last_dim, num_experts))
+            self.gate = nn.Sequential(*gate_layers)
 
         self.softmax = nn.Softmax(dim=-1)  # ONNX-friendly
     
@@ -122,7 +127,7 @@ class MoE_net(nn.Module):
         """
         return self.experts[idx]
 
-    def forward(self, x: torch.Tensor, return_gate: bool = False) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
             x: [batch, obs_dim]
@@ -353,6 +358,17 @@ class ActorCriticMoE(nn.Module):
         use_shared_backbone = moe_cfg["use_shared_backbone"]
         log_gate_distribution = moe_cfg["log_gate_distribution"]
 
+        # Create a shared gating network
+        gate_layers = []
+        last_dim = num_actor_obs  # Use actor obs dim for gate input
+        shared_gate_hidden_dims = gate_hidden_dims or []
+        act_fn = resolve_nn_activation(activation)
+        for h in shared_gate_hidden_dims:
+            gate_layers += [nn.Linear(last_dim, h), act_fn]
+            last_dim = h
+        gate_layers.append(nn.Linear(last_dim, num_experts))
+        shared_gate = nn.Sequential(*gate_layers)
+
         self.actor = MoE_net(
             obs_dim=num_actor_obs,
             act_dim=num_actions,
@@ -366,8 +382,8 @@ class ActorCriticMoE(nn.Module):
             explicit_expert_epsilon=explicit_expert_epsilon,
             jitter_noise=jitter_noise,
             use_shared_backbone=use_shared_backbone,
-            log_gate_distribution=log_gate_distribution
-            
+            log_gate_distribution=log_gate_distribution,
+            gate=shared_gate
         )
 
         # Actor observation normalization
@@ -392,7 +408,8 @@ class ActorCriticMoE(nn.Module):
             explicit_expert_epsilon=explicit_expert_epsilon,
             jitter_noise=jitter_noise,
             use_shared_backbone=use_shared_backbone,
-            log_gate_distribution=False
+            log_gate_distribution=False,
+            gate=shared_gate
         )
 
         # Critic observation normalization
