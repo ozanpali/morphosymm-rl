@@ -117,7 +117,7 @@ class MoE_net(nn.Module):
     def store_observation_and_gate(self, x: torch.Tensor):
         """Store observation batch and gating network weight distribution for analysis."""
         self._stored_observations.append(x.detach().cpu())
-        gate_logits = self.gate(x)
+        gate_logits = self.gate(x) # [num_envs,obs_dim] -> [num_envs,num_experts]
         gate_weights = self.softmax(gate_logits)
         self._stored_gate_weights.append(gate_weights.detach().cpu())
 
@@ -138,6 +138,8 @@ class MoE_net(nn.Module):
         # # Store observations and gate weights for analysis
         if self.log_gate_distribution:
             self.store_observation_and_gate(x)
+            # print("Stored observations and gate weights for analysis. Total stored batches: {}".format(len(self._stored_observations)))
+            # breakpoint() # check stored data content and shape
 
         # [batch, act_dim, K]
         if(self.use_shared_backbone):
@@ -239,17 +241,23 @@ class MoE_net(nn.Module):
             - ``percent_of_least_used_expert``: min utilization across experts.
             - ``mean weight of expert<i> for all fine``: mean gate weight for expert i when last 3 obs elements == [1, 0, 0]
             - ``mean weight of expert<i> for rear failed``: mean gate weight for expert i when last 3 obs elements == [0, 0, 1]
+            - ``mean weight of expert<i> for FL joints failed``: mean gate weight for expert i when FL leg failed
+            - ``mean weight of expert<i> for FR joints failed``: mean gate weight for expert i when FR leg failed
+            - ``mean weight of expert<i> for RL joints failed``: mean gate weight for expert i when RL leg failed
+            - ``mean weight of expert<i> for RR joints failed``: mean gate weight for expert i when RR leg failed
         """
         stats: dict[str, torch.Tensor] = {}
 
         # mean weight for each expert conditioned on 4 leg and 2 leg walking 
         obs = torch.cat(self._stored_observations, dim=0) # obs: [N, 275] only for actor
+        # print("obs is assigned")
+        # breakpoint() # check obs shape and content
         gates = torch.cat(self._stored_gate_weights, dim=0) # gates: [N, 275] only for actor
-        
+
         allfine_mask = (obs[:, -3:].round().int() == torch.tensor([1, 0, 0], device=obs.device)).all(dim=1)
         all_fine_mask = allfine_mask.nonzero(as_tuple=True)[0]
         all_fine_experts_mean = gates[all_fine_mask].mean(dim=0)
-        
+
         rearfailed_mask = (obs[:, -3:].round().int() == torch.tensor([0, 0, 1], device=obs.device)).all(dim=1)
         rear_failed_mask = rearfailed_mask.nonzero(as_tuple=True)[0]
         rear_failed_experts_mean = gates[rear_failed_mask].mean(dim=0)
@@ -262,6 +270,32 @@ class MoE_net(nn.Module):
         for i in range(5):
             stats[f"mean weight of expert{i} for rear failed"] = rear_failed_experts_mean[i].detach()
 
+        # Per-leg failure filtering
+        joint_block = obs[:, -15:-3].round().int()  # shape [N, 12]
+        leg_joint_indices = {
+            'FL': [0, 4, 8],  # hip, thigh, calf
+            'FR': [1, 5, 9],
+            'RL': [2, 6, 10],
+            'RR': [3, 7, 11],
+        }
+        for leg, indices in leg_joint_indices.items():
+            # Mask for failed leg: any joint of that leg is 0
+            failed_leg_mask = (joint_block[:, indices] == 0).all(dim=1)
+            # print("mask for failed leg {}: {}".format(leg, failed_leg_mask.nonzero(as_tuple=True)[0]))
+            # Mask for other legs: all joints of other legs are 1
+            other_legs = [l for l in leg_joint_indices if l != leg]
+            other_indices = [idx for l in other_legs for idx in leg_joint_indices[l]]
+            other_legs_mask = (joint_block[:, other_indices] == 1).all(dim=1)
+            # print("mask for other legs when leg {} failed: {}".format(leg, other_legs_mask.nonzero(as_tuple=True)[0]))
+            leg_failed_mask = (failed_leg_mask & other_legs_mask).nonzero(as_tuple=True)[0]
+            # print("mask for leg {} failed and other legs fine: {}".format(leg, leg_failed_mask))
+            # breakpoint() # check obs shape and content
+            leg_failed_experts_mean = gates[leg_failed_mask].mean(dim=0)
+            # print("mean weight for each expert when leg {} failed: {}".format(leg, leg_failed_experts_mean))
+            for i in range(5):
+                stats[f"mean weight of expert{i} for {leg} whole joints are failed"] = leg_failed_experts_mean[i].detach()
+        # print("per-leg failure stats computed")
+        # breakpoint() # check obs shape and content
         # percent utilization, mean weight of each expert and logging number of dead experts
         N = self.num_experts
         batch_size = self._last_gate_weights.shape[0]
@@ -296,7 +330,8 @@ class MoE_net(nn.Module):
         # Reset stored observations and gate weights after processing
         self._stored_observations = []
         self._stored_gate_weights = []
-
+        # print("storage cleared after computing stats. Ready for next logging interval.")
+        # breakpoint() # check stats content before logging
         return stats
 
 
@@ -445,6 +480,9 @@ class ActorCriticMoE(nn.Module):
 
         # Disable args validation for speedup
         Normal.set_default_validate_args(False)
+
+        print(f"Actor (MoE) structure:\n{self.actor}")
+        print(f"Critic (MoE) structure:\n{self.critic}")
 
     def reset(self, dones: torch.Tensor | None = None) -> None:
         pass
