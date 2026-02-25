@@ -392,17 +392,20 @@ class ActorCriticMoE(nn.Module):
         self.log_expert_stats = moe_cfg["log_expert_stats"]
         use_shared_backbone = moe_cfg["use_shared_backbone"]
         log_gate_distribution = moe_cfg["log_gate_distribution"]
+        use_shared_gate = moe_cfg.get("use_shared_gate", False)
 
         # Create a shared gating network
-        gate_layers = []
-        last_dim = num_actor_obs  # Use actor obs dim for gate input
-        shared_gate_hidden_dims = gate_hidden_dims or []
-        act_fn = resolve_nn_activation(activation)
-        for h in shared_gate_hidden_dims:
-            gate_layers += [nn.Linear(last_dim, h), act_fn]
-            last_dim = h
-        gate_layers.append(nn.Linear(last_dim, num_experts))
-        shared_gate = nn.Sequential(*gate_layers)
+        shared_gate = None
+        if use_shared_gate:
+            gate_layers = []
+            last_dim = num_actor_obs  # Use actor obs dim for gate input
+            shared_gate_hidden_dims = gate_hidden_dims or []
+            act_fn = resolve_nn_activation(activation)
+            for h in shared_gate_hidden_dims:
+                gate_layers += [nn.Linear(last_dim, h), act_fn]
+                last_dim = h
+            gate_layers.append(nn.Linear(last_dim, num_experts))
+            shared_gate = nn.Sequential(*gate_layers)
 
         self.actor = MoE_net(
             obs_dim=num_actor_obs,
