@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 from torch.distributions import Normal
 from rsl_rl.utils import resolve_nn_activation
+from rsl_rl.modules.normalizer import EmpiricalNormalization
 from typing import Any, NoReturn
 from tensordict import TensorDict
 
@@ -50,7 +51,7 @@ class MoE_net(nn.Module):
         use_explicit_expert: bool = False,
         explicit_expert_epsilon: float = 0.8,
         jitter_noise: float = 0.0,
-        use_shared_backbone: bool = True,
+        use_shared_backbone: bool = False,
         log_gate_distribution: bool = False,
         gate: nn.Module = None
     ):
@@ -157,11 +158,9 @@ class MoE_net(nn.Module):
             noise = torch.empty_like(gate_logits).uniform_(1.0 - self.jitter_noise, 1.0 + self.jitter_noise)
             gate_logits = gate_logits * noise
 
-        unmasked_router_probs = self.softmax(gate_logits)
-        self._unmasked_router_probs = unmasked_router_probs 
 
         # ---- gating ----
-        if self.top_k >= 1 and self.top_k <= self.num_experts:
+        if self.top_k >= 1 and self.top_k < self.num_experts:
             # top-k sparse MoE
             topk_vals, topk_idx = torch.topk(gate_logits, k=self.top_k, dim=-1)
             masked_logits = torch.full_like(gate_logits, float("-inf"))
@@ -211,7 +210,7 @@ class MoE_net(nn.Module):
 
         N = self.num_experts
 
-        if self.top_k >= 1 and self.top_k <= self.num_experts:
+        if self.top_k >= 1 and self.top_k < self.num_experts:
             # --- Sparse routing: Switch Transformer loss (Eq. 4-6) ---
             # router_probs: full softmax probabilities [batch, K]
             router_probs = self._last_unmasked_gate_weights.squeeze(1)  # [batch, K]
