@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 from torch.distributions import Normal
 from rsl_rl.utils import resolve_nn_activation
-from rsl_rl.modules.normalizer import EmpiricalNormalization
+# from rsl_rl.modules.normalizer import EmpiricalNormalization
 from typing import Any, NoReturn
 from tensordict import TensorDict
 
@@ -261,12 +261,13 @@ class MoE_net(nn.Module):
         rear_failed_mask = rearfailed_mask.nonzero(as_tuple=True)[0]
         rear_failed_experts_mean = gates[rear_failed_mask].mean(dim=0)
 
+        N = self.num_experts
         # Log mean weight for each expert for all fine
-        for i in range(5):
+        for i in range(N):
             stats[f"mean weight of expert{i} for all fine"] = all_fine_experts_mean[i].detach()
 
         # Log mean weight for each expert for rear failed
-        for i in range(5):
+        for i in range(N):
             stats[f"mean weight of expert{i} for rear failed"] = rear_failed_experts_mean[i].detach()
 
         # Per-leg failure filtering
@@ -291,12 +292,11 @@ class MoE_net(nn.Module):
             # breakpoint() # check obs shape and content
             leg_failed_experts_mean = gates[leg_failed_mask].mean(dim=0)
             # print("mean weight for each expert when leg {} failed: {}".format(leg, leg_failed_experts_mean))
-            for i in range(5):
+            for i in range(N):
                 stats[f"mean weight of expert{i} for {leg} whole joints are failed"] = leg_failed_experts_mean[i].detach()
         # print("per-leg failure stats computed")
         # breakpoint() # check obs shape and content
         # percent utilization, mean weight of each expert and logging number of dead experts
-        N = self.num_experts
         batch_size = self._last_gate_weights.shape[0]
 
         if self.top_k >= 1 and self.top_k <= self.num_experts:
