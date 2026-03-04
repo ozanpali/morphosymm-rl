@@ -508,8 +508,9 @@ class ActorCriticMoE(nn.Module):
         """
         Mean gate entropy from last forward pass (useful for PPO regularization)
         """
-        w = self.actor._last_gate_weights
-        return -(w * torch.log(w + 1e-8)).sum(dim=-1).mean()
+        w = self.actor._last_gate_weights.squeeze(1)  # [batch, K]
+        mean_w = w.mean(dim=0)  # [K] - average weight per expert across batch
+        return -(mean_w * torch.log(mean_w + 1e-8)).sum()  # Entropy of expert distribution
 
     def load_balance_loss(self) -> torch.Tensor:
         """Aggregate load-balancing loss from the actor MoE."""
