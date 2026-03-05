@@ -69,9 +69,6 @@ class MoE_net(nn.Module):
         self._stored_observations = []
         self._stored_gate_weights = []
 
-        # Store last gate weights as a tensor sentinel (empty tensor) so TorchScript
-        # sees a consistent attribute type (Tensor) instead of switching from NoneType
-        # to Tensor during execution.
         self._last_gate_weights = torch.empty(0)
         self._last_unmasked_gate_weights = torch.empty(0)
         self.use_gate_loss = use_gate_loss
@@ -80,6 +77,8 @@ class MoE_net(nn.Module):
 
         self.use_shared_backbone = use_shared_backbone
         self.log_gate_distribution = log_gate_distribution
+        self.shared_backbone: nn.Module = nn.Identity()
+
         if(self.use_shared_backbone):
             # Shared trunk + separate expert heads
             shared_layers = [nn.Linear(obs_dim, hidden_dims[0]), act]
