@@ -16,6 +16,9 @@ from rsl_rl.modules.rnd import RandomNetworkDistillation
 from rsl_rl.storage import RolloutStorage
 from rsl_rl.utils import resolve_callable
 
+# Optional import for type checking
+from morphosymm_rl.modules.ac_multi_critic import ActorCriticMultiCritic
+
 
 class PPO:
     """Proximal Policy Optimization algorithm (https://arxiv.org/abs/1707.06347)."""
@@ -122,12 +125,44 @@ class PPO:
         self.learning_rate = learning_rate
         self.normalize_advantage_per_mini_batch = normalize_advantage_per_mini_batch
 
+        # ---- Multi-Critic "paper" mode detection ----
+        # When the policy is ActorCriticMultiCritic in "paper" mode, evaluate()
+        # returns [batch, num_critics] instead of [batch, 1].  We handle the
+        # conversion to a storage-compatible scalar inside act/compute_returns/update.
+        self._is_mc_paper = (
+            isinstance(policy, ActorCriticMultiCritic)
+            and getattr(policy, "multi_critic_mode", "routed") == "paper"
+        )
+        if self._is_mc_paper:
+            nc = policy.num_critics
+            T = storage.num_transitions_per_env
+            N = storage.num_envs
+            # Parallel buffer for full multi-critic values [T, N, num_critics]
+            self._mc_values = torch.zeros(T, N, nc, device=device)
+            # Parallel buffer for the routing one-hot [T, N, num_critics]
+            self._mc_routing = torch.zeros(T, N, nc, device=device)
+            self._mc_step = 0
+            print(f"[PPO] Multi-Critic paper mode enabled with {nc} critics.")
+
     def act(self, obs: TensorDict) -> torch.Tensor:
         if self.policy.is_recurrent:
             self.transition.hidden_states = self.policy.get_hidden_states()
         # Compute the actions and values
         self.transition.actions = self.policy.act(obs).detach()
-        self.transition.values = self.policy.evaluate(obs).detach()
+
+        if self._is_mc_paper:
+            # evaluate() returns [N, num_critics] in paper mode
+            mc_values = self.policy.evaluate(obs).detach()  # [N, K]
+            routing = self.policy._extract_routing(obs).detach()  # [N, K]
+            # Store full multi-critic data in parallel buffers
+            self._mc_values[self._mc_step] = mc_values
+            self._mc_routing[self._mc_step] = routing
+            self._mc_step += 1
+            # Compute routing-weighted scalar for standard storage  [N, 1]
+            self.transition.values = (mc_values * routing).sum(dim=-1, keepdim=True)
+        else:
+            self.transition.values = self.policy.evaluate(obs).detach()
+
         self.transition.actions_log_prob = self.policy.get_actions_log_prob(self.transition.actions).detach()
         self.transition.action_mean = self.policy.action_mean.detach()
         self.transition.action_sigma = self.policy.action_std.detach()
@@ -168,26 +203,75 @@ class PPO:
 
     def compute_returns(self, obs: TensorDict) -> None:
         st = self.storage
-        # Compute value for the last step
-        last_values = self.policy.evaluate(obs).detach()
-        # Compute returns and advantages
-        advantage = 0
-        for step in reversed(range(st.num_transitions_per_env)):
-            # If we are at the last step, bootstrap the return value
-            next_values = last_values if step == st.num_transitions_per_env - 1 else st.values[step + 1]
-            # 1 if we are not in a terminal state, 0 otherwise
-            next_is_not_terminal = 1.0 - st.dones[step].float()
-            # TD error: r_t + gamma * V(s_{t+1}) - V(s_t)
-            delta = st.rewards[step] + next_is_not_terminal * self.gamma * next_values - st.values[step]
-            # Advantage: A(s_t, a_t) = delta_t + gamma * lambda * A(s_{t+1}, a_{t+1})
-            advantage = delta + next_is_not_terminal * self.gamma * self.lam * advantage
-            # Return: R_t = A(s_t, a_t) + V(s_t)
-            st.returns[step] = advantage + st.values[step]
-        # Compute the advantages
-        st.advantages = st.returns - st.values
-        # Normalize the advantages if per minibatch normalization is not used
-        if not self.normalize_advantage_per_mini_batch:
-            st.advantages = (st.advantages - st.advantages.mean()) / (st.advantages.std() + 1e-8)
+
+        if self._is_mc_paper:
+            # ---- Paper-faithful multi-critic GAE ----
+            # Compute last-step multi-critic values
+            mc_last_values = self.policy.evaluate(obs).detach()  # [N, K]
+            last_routing = self.policy._extract_routing(obs).detach()  # [N, K]
+
+            nc = self.policy.num_critics
+            mc_vals = self._mc_values  # [T, N, K]
+            mc_rout = self._mc_routing  # [T, N, K]
+
+            # Per-critic returns: discount_cumsum of (scalar reward broadcast to K critics)
+            # Since all critics share the same reward, we compute per-critic returns
+            # and advantages using the approach from Mysore et al.:
+            #   delta = ((r + gamma * V_next - V) * routing).sum(-1)   → scalar
+            #   advantage = discount_cumsum(delta, gamma * lam)
+            #   per-critic return = discount_cumsum(reward, gamma)  (same for all critics)
+
+            mc_advantage = torch.zeros(st.num_envs, nc, device=self.device)
+            advantage_scalar = torch.zeros(st.num_envs, 1, device=self.device)
+
+            for step in reversed(range(st.num_transitions_per_env)):
+                if step == st.num_transitions_per_env - 1:
+                    next_mc_vals = mc_last_values
+                    next_routing = last_routing
+                else:
+                    next_mc_vals = mc_vals[step + 1]
+                    next_routing = mc_rout[step + 1]
+
+                next_is_not_terminal = 1.0 - st.dones[step].float()  # [N, 1]
+
+                # Per-critic TD error, masked by routing, summed to scalar
+                # Exactly: delta = ((r + gamma * V_next - V) * routing).sum(-1)
+                rewards_expanded = st.rewards[step].expand(-1, nc)  # [N, K]
+                per_critic_delta = rewards_expanded + next_is_not_terminal * self.gamma * next_mc_vals - mc_vals[step]
+                # Mask by current step's routing and sum → scalar
+                routing_step = mc_rout[step]  # [N, K]
+                delta_scalar = (per_critic_delta * routing_step).sum(dim=-1, keepdim=True)  # [N, 1]
+
+                # Standard GAE accumulation (scalar)
+                advantage_scalar = delta_scalar + next_is_not_terminal * self.gamma * self.lam * advantage_scalar
+
+                # Return and advantage (stored as scalar in standard storage)
+                # Return = advantage + V_active (routing-weighted scalar)
+                v_active = (mc_vals[step] * routing_step).sum(dim=-1, keepdim=True)  # [N, 1]
+                st.returns[step] = advantage_scalar + v_active
+
+            # Scalar advantages
+            st.advantages = st.returns - st.values
+
+            # Normalize advantages
+            if not self.normalize_advantage_per_mini_batch:
+                st.advantages = (st.advantages - st.advantages.mean()) / (st.advantages.std() + 1e-8)
+
+            # Reset MC step counter for next rollout
+            self._mc_step = 0
+        else:
+            # ---- Standard single-critic GAE ----
+            last_values = self.policy.evaluate(obs).detach()
+            advantage = 0
+            for step in reversed(range(st.num_transitions_per_env)):
+                next_values = last_values if step == st.num_transitions_per_env - 1 else st.values[step + 1]
+                next_is_not_terminal = 1.0 - st.dones[step].float()
+                delta = st.rewards[step] + next_is_not_terminal * self.gamma * next_values - st.values[step]
+                advantage = delta + next_is_not_terminal * self.gamma * self.lam * advantage
+                st.returns[step] = advantage + st.values[step]
+            st.advantages = st.returns - st.values
+            if not self.normalize_advantage_per_mini_batch:
+                st.advantages = (st.advantages - st.advantages.mean()) / (st.advantages.std() + 1e-8)
 
     def update(self) -> dict[str, float]:
         mean_value_loss = 0
@@ -247,7 +331,47 @@ class PPO:
             # Note: We need to do this because we updated the policy with the new parameters
             self.policy.act(obs_batch, masks=masks_batch, hidden_state=hidden_states_batch[0])
             actions_log_prob_batch = self.policy.get_actions_log_prob(actions_batch)
-            value_batch = self.policy.evaluate(obs_batch, masks=masks_batch, hidden_state=hidden_states_batch[1])
+
+            if self._is_mc_paper:
+                # Paper-faithful multi-critic value loss:
+                # evaluate() returns [batch, num_critics]; we compute a masked loss
+                # so that only the active critic (selected by routing) is trained.
+                mc_value_batch = self.policy.evaluate(obs_batch, masks=masks_batch, hidden_state=hidden_states_batch[1])
+                # [batch, K]
+                routing_batch = self.policy._extract_routing(obs_batch)  # [batch, K]
+
+                # Routing-weighted scalar for surrogate loss compatibility
+                value_batch = (mc_value_batch * routing_batch).sum(dim=-1, keepdim=True)  # [batch, 1]
+
+                # Masked per-critic value loss (Mysore et al. Eq. in supplementary):
+                #   loss_v = MSE(routing * V_all, routing * ret_expanded)
+                nc = self.policy.num_critics
+                returns_expanded = returns_batch.expand(-1, nc)  # [batch, K]
+
+                if self.use_clipped_value_loss:
+                    target_expanded = target_values_batch.expand(-1, nc)  # [batch, K]
+                    mc_value_clipped = target_expanded + (mc_value_batch - target_expanded).clamp(
+                        -self.clip_param, self.clip_param
+                    )
+                    mc_losses = (routing_batch * (mc_value_batch - returns_expanded)).pow(2)
+                    mc_losses_clipped = (routing_batch * (mc_value_clipped - returns_expanded)).pow(2)
+                    value_loss = torch.max(mc_losses, mc_losses_clipped).mean()
+                else:
+                    value_loss = (routing_batch * (mc_value_batch - returns_expanded)).pow(2).mean()
+            else:
+                value_batch = self.policy.evaluate(obs_batch, masks=masks_batch, hidden_state=hidden_states_batch[1])
+
+                # Standard value function loss
+                if self.use_clipped_value_loss:
+                    value_clipped = target_values_batch + (value_batch - target_values_batch).clamp(
+                        -self.clip_param, self.clip_param
+                    )
+                    value_losses = (value_batch - returns_batch).pow(2)
+                    value_losses_clipped = (value_clipped - returns_batch).pow(2)
+                    value_loss = torch.max(value_losses, value_losses_clipped).mean()
+                else:
+                    value_loss = (returns_batch - value_batch).pow(2).mean()
+
             # Note: We only keep the entropy of the first augmentation (the original one)
             mu_batch = self.policy.action_mean[:original_batch_size]
             sigma_batch = self.policy.action_std[:original_batch_size]
@@ -296,17 +420,6 @@ class PPO:
                 ratio, 1.0 - self.clip_param, 1.0 + self.clip_param
             )
             surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
-
-            # Value function loss
-            if self.use_clipped_value_loss:
-                value_clipped = target_values_batch + (value_batch - target_values_batch).clamp(
-                    -self.clip_param, self.clip_param
-                )
-                value_losses = (value_batch - returns_batch).pow(2)
-                value_losses_clipped = (value_clipped - returns_batch).pow(2)
-                value_loss = torch.max(value_losses, value_losses_clipped).mean()
-            else:
-                value_loss = (returns_batch - value_batch).pow(2).mean()
 
             loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
 
@@ -427,6 +540,10 @@ class PPO:
         # MoE expert utilization stats (logged per-expert to detect dead experts)
         if hasattr(self.policy, "log_expert_stats") and self.policy.log_expert_stats:
             loss_dict.update(self.policy.get_expert_stats())
+
+        # Multi-Critic utilization stats
+        if hasattr(self.policy, "log_critic_stats") and self.policy.log_critic_stats:
+            loss_dict.update(self.policy.get_critic_stats())
 
         return loss_dict
 

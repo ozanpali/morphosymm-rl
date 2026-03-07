@@ -26,6 +26,7 @@ from rsl_rl.utils.logger import Logger
 
 # from morphosymm_rl.modules.ac_symm import ActorCriticSymm
 from morphosymm_rl.modules.ac_moe import ActorCriticMoE
+from morphosymm_rl.modules.ac_multi_critic import ActorCriticMultiCritic
 from morphosymm_rl.algorithms.ppo_symm_data_augment import PPOSymmDataAugmented
 from morphosymm_rl.algorithms.ppo import PPO
 
@@ -45,6 +46,9 @@ class SymmOnPolicyRunner:
 
         # Mixture of Expert configuration
         self.moe_cfg = train_cfg["moe_cfg"]
+
+        # Multi-Critic configuration
+        self.multicritic_cfg = train_cfg.get("multicritic_cfg", {})
 
         # Setup multi-GPU training if enabled
         self._configure_multi_gpu()
@@ -287,6 +291,14 @@ class SymmOnPolicyRunner:
             self.policy_cfg.pop("class_name")
             actor_critic: ActorCriticMoE = ActorCriticMoE(
                 obs, self.cfg["obs_groups"], self.env.num_actions, **self.policy_cfg, **self.moe_cfg
+            ).to(self.device)
+        elif self.policy_cfg["class_name"] == "ActorCriticMultiCritic":
+            self.policy_cfg.pop("class_name")
+            mc_cfg = {k: v for k, v in self.multicritic_cfg.items() if k != "class_name"}
+            moe_cfg = {k: v for k, v in self.moe_cfg.items() if k != "class_name"}
+            actor_critic: ActorCriticMultiCritic = ActorCriticMultiCritic(
+                obs, self.cfg["obs_groups"], self.env.num_actions,
+                **self.policy_cfg, **mc_cfg, **moe_cfg
             ).to(self.device)
         else:
             actor_critic_class = resolve_callable(self.policy_cfg.pop("class_name"))
