@@ -430,23 +430,23 @@ class ActorCriticMoE(nn.Module):
             self.actor_obs_normalizer = torch.nn.Identity()
 
         # Critic
-        # self.critic = MLP_net(num_critic_obs, critic_hidden_dims, 1, act)
-        self.critic = MoE_net(
-            obs_dim=num_critic_obs,
-            act_dim=1,
-            hidden_dims=critic_hidden_dims,
-            gate_hidden_dims=gate_hidden_dims,
-            activation=activation,
-            num_experts=num_experts,
-            top_k=top_k,
-            use_gate_loss=use_gate_loss,
-            use_explicit_expert=use_explicit_expert,
-            explicit_expert_epsilon=explicit_expert_epsilon,
-            jitter_noise=jitter_noise,
-            use_shared_backbone=use_shared_backbone,
-            log_gate_distribution=False,
-            gate=shared_gate
-        )
+        self.critic = MLP_net(num_critic_obs, critic_hidden_dims, 1, act)
+        # self.critic = MoE_net(
+        #     obs_dim=num_critic_obs,
+        #     act_dim=1,
+        #     hidden_dims=critic_hidden_dims,
+        #     gate_hidden_dims=gate_hidden_dims,
+        #     activation=activation,
+        #     num_experts=num_experts,
+        #     top_k=top_k,
+        #     use_gate_loss=use_gate_loss,
+        #     use_explicit_expert=use_explicit_expert,
+        #     explicit_expert_epsilon=explicit_expert_epsilon,
+        #     jitter_noise=jitter_noise,
+        #     use_shared_backbone=use_shared_backbone,
+        #     log_gate_distribution=False,
+        #     gate=shared_gate
+        # )
 
         # Critic observation normalization
         self.critic_obs_normalization = critic_obs_normalization
