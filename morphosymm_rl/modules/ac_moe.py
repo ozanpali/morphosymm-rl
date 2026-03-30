@@ -507,12 +507,16 @@ class ActorCriticMoE(nn.Module):
         """
         Mean gate entropy from last forward pass (useful for PPO regularization)
         """
+        # if not isinstance(self.actor, MoE_net):
+        #     return torch.tensor(0.0, device=next(self.parameters()).device)
         w = self.actor._last_gate_weights.squeeze(1)  # [batch, K]
         mean_w = w.mean(dim=0)  # [K] - average weight per expert across batch
         return -(mean_w * torch.log(mean_w + 1e-8)).sum()  # Entropy of expert distribution
 
     def load_balance_loss(self) -> torch.Tensor:
         """Aggregate load-balancing loss from the actor MoE."""
+        # if not isinstance(self.actor, MoE_net):
+        #     return torch.tensor(0.0, device=next(self.parameters()).device)
         return self.actor.load_balance_loss()
 
     def get_expert_stats(self) -> dict[str, float]:
@@ -520,6 +524,8 @@ class ActorCriticMoE(nn.Module):
 
         Keys are prefixed with ``MoE/`` so they appear in a dedicated group.
         """
+        # if not isinstance(self.actor, MoE_net):
+        #     return {}
         raw = self.actor.expert_utilization_stats()
         return {f"MoE/{k}": v.item() if isinstance(v, torch.Tensor) else v for k, v in raw.items()}
 

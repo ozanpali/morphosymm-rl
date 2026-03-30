@@ -40,11 +40,12 @@ class SymmOnPolicyRunner:
         self.device = device
         self.env = env
 
-        # Morphological symmetries configuration
-        self.morphologycal_symmetries_cfg = train_cfg["morphologycal_symmetries_cfg"]
+        # MorphoSymm-specific configuration blocks are optional because this runner
+        # can also be used as a drop-in replacement for standard PPO training.
+        self.morphologycal_symmetries_cfg = train_cfg.get("morphologycal_symmetries_cfg", {})
 
-        # Mixture of Expert configuration
-        self.moe_cfg = train_cfg["moe_cfg"]
+        # Mixture of Experts configuration (optional)
+        self.moe_cfg = train_cfg.get("moe_cfg", {})
 
         # Setup multi-GPU training if enabled
         self._configure_multi_gpu()
@@ -264,6 +265,31 @@ class SymmOnPolicyRunner:
 
         # Resolve symmetry config if used
         self.alg_cfg = resolve_symmetry_config(self.alg_cfg, self.env)
+
+        # Remove unsupported optimizer argument for PPO for compatibility with
+        # older rsl-rl / PPO implementations that do not expose this keyword.
+        if "optimizer" in self.alg_cfg:
+            optimizer_name = self.alg_cfg.get("optimizer")
+            if optimizer_name != "adam":
+                print(
+                    "[WARNING]: The `optimizer` parameter for PPO is only available for newer "
+                    "versions of rsl-rl. This codebase uses a version without this feature. "
+                    "Defaulting to `adam` optimizer."
+                )
+            # In all cases, drop the argument so that PPO.__init__ does not receive it.
+            self.alg_cfg.pop("optimizer", None)
+
+        # IsaacLab's config schema includes a `share_cnn_encoders` knob for some rsl-rl versions.
+        # This MorphoSymm PPO implementation (and its ActorCriticCNN) does not support it.
+        # Drop it to avoid passing unexpected kwargs into PPO / PPOSymmDataAugmented.
+        if "share_cnn_encoders" in self.alg_cfg:
+            share_cnn_encoders = self.alg_cfg.pop("share_cnn_encoders", False)
+            if share_cnn_encoders:
+                print(
+                    "[WARNING]: The `share_cnn_encoders` parameter is not supported by this "
+                    "MorphoSymm PPO implementation and will be ignored (actor/critic CNN encoders "
+                    "will not be shared)."
+                )
 
         # Resolve deprecated normalization config
         if self.cfg.get("empirical_normalization") is not None:

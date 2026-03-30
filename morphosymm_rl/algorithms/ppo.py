@@ -47,6 +47,10 @@ class PPO:
         symmetry_cfg: dict | None = None,
         # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
+        # Load-balancing loss parameters
+        load_balance_coef: float = 0.001,
+        load_balance_decay: float = 0.99,
+        load_balance_min: float = 1e-8,
     ) -> None:
         # Device-related parameters
         self.device = device
@@ -121,6 +125,11 @@ class PPO:
         self.schedule = schedule
         self.learning_rate = learning_rate
         self.normalize_advantage_per_mini_batch = normalize_advantage_per_mini_batch
+
+        # Load-balancing loss parameters (adaptive decay)
+        self.load_balance_coef = load_balance_coef
+        self.load_balance_decay = load_balance_decay
+        self.load_balance_min = load_balance_min
 
     def act(self, obs: TensorDict) -> torch.Tensor:
         if self.policy.is_recurrent:
@@ -367,8 +376,8 @@ class PPO:
             # Load-balancing auxiliary loss (Fedus et al., 2022)
             if hasattr(self.policy, "use_load_balance_loss") and self.policy.use_load_balance_loss:
                 lb_loss = self.policy.load_balance_loss()
-                load_balance_coef = 0.0001
-                loss += load_balance_coef * lb_loss
+                print(f"Load-balancing loss: {lb_loss.item()}, coefficient: {self.load_balance_coef}")
+                loss += self.load_balance_coef * lb_loss
 
             # Compute the gradients for PPO
             self.optimizer.zero_grad()
@@ -410,6 +419,9 @@ class PPO:
         if mean_symmetry_loss is not None:
             mean_symmetry_loss /= num_updates
 
+        # Decay the load-balancing coefficient
+        self.load_balance_coef = max(self.load_balance_min, self.load_balance_coef * self.load_balance_decay)
+
         # Clear the storage
         self.storage.clear()
 
@@ -427,6 +439,9 @@ class PPO:
         # MoE expert utilization stats (logged per-expert to detect dead experts)
         if hasattr(self.policy, "log_expert_stats") and self.policy.log_expert_stats:
             loss_dict.update(self.policy.get_expert_stats())
+
+        # Log the current load-balancing coefficient
+        loss_dict["load_balance_coef"] = self.load_balance_coef
 
         return loss_dict
 
